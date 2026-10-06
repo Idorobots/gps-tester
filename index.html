@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GPS Tester</title>
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">GPS Tester</div>
+      <div class="controls">
+        <label class="control">
+          Baud
+          <select id="baud"></select>
+        </label>
+        <button id="connectBtn" class="btn primary" type="button">Connect</button>
+      </div>
+      <div class="topbar-right">
+        <span id="deviceName" class="device-name" hidden></span>
+        <span id="connBadge" class="badge off"><span class="act-dot" id="actDot"></span><span id="connText">Disconnected</span></span>
+      </div>
+    </header>
+    <div id="banner" class="banner" hidden></div>
+    <main class="layout">
+      <section class="sidebar">
+        <div class="card">
+          <div class="card-title">Fix</div>
+          <div id="fixLabel" class="fix-label nofix">No Fix</div>
+          <div id="fixDetail" class="fix-detail">Waiting for signal…</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Position</div>
+          <dl class="kv">
+            <dt>Latitude</dt>
+            <dd id="lat">—</dd>
+            <dt>Longitude</dt>
+            <dd id="lon">—</dd>
+            <dt>Altitude</dt>
+            <dd id="alt">—</dd>
+            <dt>HDOP</dt>
+            <dd id="hdop">—</dd>
+          </dl>
+        </div>
+        <div class="card">
+          <div class="card-title">Motion</div>
+          <dl class="kv">
+            <dt>Speed</dt>
+            <dd id="speed">—</dd>
+            <dt>Knots</dt>
+            <dd id="knots">—</dd>
+            <dt>Course</dt>
+            <dd id="course">—</dd>
+          </dl>
+        </div>
+        <div class="card">
+          <div class="card-title">Satellites</div>
+          <div id="satCounts" class="sat-counts">0 used · 0 in view</div>
+          <canvas id="skyplot"></canvas>
+        </div>
+      </section>
+      <section class="map-wrap">
+        <div id="map"></div>
+        <label class="follow-toggle">
+          <input type="checkbox" id="follow" checked />
+          Follow
+        </label>
+      </section>
+      <section class="sidebar right">
+        <div class="card">
+          <div class="card-title">Feed</div>
+          <dl class="kv">
+            <dt>Traffic</dt>
+            <dd id="traffic">Idle</dd>
+            <dt>UTC</dt>
+            <dd id="feedTime">—</dd>
+            <dt>Last message</dt>
+            <dd id="feedLast">—</dd>
+            <dt>Received</dt>
+            <dd id="feedCount">0</dd>
+            <dt>Errors</dt>
+            <dd id="feedErrors">0</dd>
+          </dl>
+          <button id="simBtn" class="btn sim-btn" type="button">Simulate</button>
+        </div>
+        <div class="card raw-card" id="rawCard">
+          <button class="card-title card-toggle" id="rawToggle" type="button">
+            Raw NMEA
+            <span class="chevron">▸</span>
+          </button>
+          <pre id="rawLog" hidden></pre>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

@@ -340,8 +340,18 @@ select:hover,
 }
 
 @media (max-width: 980px) {
+  html,
+  body {
+    height: auto;
+  }
+
   .layout {
     grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    overflow: visible;
+    min-height: 0;
   }
 
   .map-wrap {

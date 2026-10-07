@@ -3,8 +3,10 @@ export const BAUD_RATES = [4800, 9600, 19200, 38400, 57600, 115200, 230400] as c
 export type LineHandler = (line: string) => void;
 
 export interface DeviceInfo {
+  kind: "serial" | "ble";
   vendorId?: number;
   productId?: number;
+  name?: string;
 }
 
 export interface UsbDeviceDescriptor {
@@ -29,6 +31,13 @@ export const USB_SERIAL_DEVICES: readonly UsbDeviceDescriptor[] = [
 ];
 
 const USB_SERIAL_FILTERS = USB_SERIAL_DEVICES.map((d) => ({ usbVendorId: d.vendorId }));
+
+export const SPP_SERVICE_UUID = "00001101-0000-1000-8000-00805f9b34fb";
+
+const PORT_FILTERS: SerialPortFilter[] = [
+  ...USB_SERIAL_FILTERS,
+  { bluetoothServiceClassId: SPP_SERVICE_UUID },
+];
 
 export function emitLines(buffer: string, onLine: LineHandler): string {
   let idx: number;
@@ -58,7 +67,7 @@ export class SerialGpsLink {
     if (!this.port) return null;
     try {
       const info = this.port.getInfo();
-      return { vendorId: info.usbVendorId, productId: info.usbProductId };
+      return { kind: "serial", vendorId: info.usbVendorId, productId: info.usbProductId };
     } catch {
       return null;
     }
@@ -66,7 +75,7 @@ export class SerialGpsLink {
 
   async connect(baudRate: number, onLine: LineHandler, onClosed: (error?: unknown) => void): Promise<void> {
     if (this.isOpen) await this.disconnect();
-    const port = await navigator.serial.requestPort({ filters: USB_SERIAL_FILTERS });
+    const port = await navigator.serial.requestPort({ filters: PORT_FILTERS });
     await port.open({ baudRate });
     this.port = port;
     this.running = true;

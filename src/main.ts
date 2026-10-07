@@ -1,6 +1,7 @@
 import "./style.css";
 import { BAUD_RATES, SerialGpsLink, USB_SERIAL_DEVICES } from "./serial";
 import type { DeviceInfo } from "./serial";
+import { BluetoothLeLink } from "./bluetooth";
 import { applyLine, createGnssState } from "./nmea";
 import type { GnssState } from "./types";
 import { drawSkyPlot } from "./skyplot";
@@ -11,6 +12,7 @@ const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) 
 
 const baudSelect = $<HTMLSelectElement>("baud");
 const connectBtn = $<HTMLButtonElement>("connectBtn");
+const bleBtn = $<HTMLButtonElement>("bleBtn");
 const simBtn = $<HTMLButtonElement>("simBtn");
 const deviceName = $("deviceName");
 const rawCard = $("rawCard");
@@ -54,6 +56,11 @@ if (!SerialGpsLink.isSupported()) {
   connectBtn.disabled = true;
 }
 
+if (!BluetoothLeLink.isSupported()) {
+  bleBtn.disabled = true;
+  bleBtn.title = "Web Bluetooth is not available in this browser";
+}
+
 let state: GnssState = createGnssState();
 let rawLines: string[] = [];
 let noiseCount = 0;
@@ -61,6 +68,7 @@ let lastLineMs: number | null = null;
 let msgRate = 0;
 let lastRateCount = 0;
 const link = new SerialGpsLink();
+const bleLink = new BluetoothLeLink();
 const sim = new NmeaSimulator();
 let simRunning = false;
 let rawOpen = false;
@@ -74,10 +82,14 @@ function hex4(n: number | undefined): string {
 }
 
 function describeDevice(info: DeviceInfo | null): string {
-  if (!info || info.vendorId == null) return "Serial device";
-  const vendor = vendorName(info.vendorId);
-  const id = `${hex4(info.vendorId)}:${hex4(info.productId)}`;
-  return vendor ? `${vendor} (${id})` : `USB ${id}`;
+  if (!info) return "Serial device";
+  if (info.name) return info.name;
+  if (info.vendorId != null) {
+    const vendor = vendorName(info.vendorId);
+    const id = `${hex4(info.vendorId)}:${hex4(info.productId)}`;
+    return vendor ? `${vendor} (${id})` : `USB ${id}`;
+  }
+  return info.kind === "ble" ? "BLE device" : "Serial device";
 }
 
 function setDeviceLabel(text: string | null): void {
@@ -170,7 +182,7 @@ function render(): void {
   feedCount.textContent = String(state.messageCount);
   feedErrors.textContent = String(state.errorCount);
 
-  const connected = simRunning || link.isOpen;
+  const connected = simRunning || link.isOpen || bleLink.isOpen;
   const ageMs = lastLineMs == null ? Infinity : Date.now() - lastLineMs;
   let trafficClass = "";
   let trafficText = "Idle";
@@ -219,19 +231,32 @@ function resetState(): void {
 }
 
 function errText(err: unknown): string {
-  if (err instanceof DOMException && err.name === "NotFoundError") return "no serial port selected.";
+  if (err instanceof DOMException && err.name === "NotFoundError") return "nothing was selected.";
   return String(err);
+}
+
+function resetTransportUi(): void {
+  setBadge("off", "Disconnected");
+  setDeviceLabel(null);
+  connectBtn.textContent = "Connect";
+  bleBtn.textContent = "BLE";
+}
+
+async function closeBle(): Promise<void> {
+  if (bleLink.isOpen) {
+    await bleLink.disconnect();
+    bleBtn.textContent = "BLE";
+  }
 }
 
 connectBtn.addEventListener("click", async () => {
   if (simRunning) toggleSim();
   if (link.isOpen) {
     await link.disconnect();
-    setBadge("off", "Disconnected");
-    setDeviceLabel(null);
-    connectBtn.textContent = "Connect";
+    resetTransportUi();
     return;
   }
+  await closeBle();
   try {
     resetState();
     await link.connect(
@@ -239,9 +264,7 @@ connectBtn.addEventListener("click", async () => {
       onLine,
       async (err) => {
         await link.disconnect();
-        setBadge("off", "Disconnected");
-        setDeviceLabel(null);
-        connectBtn.textContent = "Connect";
+        resetTransportUi();
         if (err) {
           banner.hidden = false;
           banner.textContent = `Serial error: ${errText(err)}`;
@@ -253,10 +276,41 @@ connectBtn.addEventListener("click", async () => {
     connectBtn.textContent = "Disconnect";
     banner.hidden = true;
   } catch (err) {
-    setBadge("off", "Disconnected");
-    setDeviceLabel(null);
+    resetTransportUi();
     banner.hidden = false;
     banner.textContent = `Could not open serial port: ${errText(err)}`;
+  }
+});
+
+bleBtn.addEventListener("click", async () => {
+  if (!BluetoothLeLink.isSupported()) return;
+  if (simRunning) toggleSim();
+  if (bleLink.isOpen) {
+    await bleLink.disconnect();
+    resetTransportUi();
+    return;
+  }
+  if (link.isOpen) {
+    await link.disconnect();
+  }
+  try {
+    resetState();
+    await bleLink.connect(onLine, async (err) => {
+      await bleLink.disconnect();
+      resetTransportUi();
+      if (err) {
+        banner.hidden = false;
+        banner.textContent = `Bluetooth error: ${errText(err)}`;
+      }
+    });
+    setBadge("on", "Connected (BLE)");
+    setDeviceLabel(describeDevice(bleLink.getDeviceInfo()));
+    bleBtn.textContent = "Disconnect";
+    banner.hidden = true;
+  } catch (err) {
+    resetTransportUi();
+    banner.hidden = false;
+    banner.textContent = `Could not connect via Bluetooth: ${errText(err)}`;
   }
 });
 
@@ -280,6 +334,11 @@ function toggleSim(): void {
   if (link.isOpen) {
     void link.disconnect();
     connectBtn.textContent = "Connect";
+    setDeviceLabel(null);
+  }
+  if (bleLink.isOpen) {
+    void bleLink.disconnect();
+    bleBtn.textContent = "BLE";
     setDeviceLabel(null);
   }
   resetState();

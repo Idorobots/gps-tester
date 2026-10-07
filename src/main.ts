@@ -49,16 +49,26 @@ for (const b of BAUD_RATES) {
   baudSelect.append(opt);
 }
 
-if (!SerialGpsLink.isSupported()) {
+if (!window.isSecureContext) {
   banner.hidden = false;
   banner.textContent =
-    "Web Serial is not available in this browser. Use a Chromium-based browser (Chrome, Edge, Opera) over HTTPS or localhost.";
+    "Web Serial and Web Bluetooth require a secure context. Open this page via http://localhost:5173 or an HTTPS URL, then reload.";
   connectBtn.disabled = true;
-}
-
-if (!BluetoothLeLink.isSupported()) {
   bleBtn.disabled = true;
-  bleBtn.title = "Web Bluetooth is not available in this browser";
+} else {
+  if (!SerialGpsLink.isSupported()) {
+    banner.hidden = false;
+    banner.textContent =
+      "Web Serial is not available in this browser. Use a Chromium-based browser (Chrome, Edge, Opera).";
+    connectBtn.disabled = true;
+  }
+  if (!BluetoothLeLink.isSupported()) {
+    bleBtn.disabled = true;
+    const isLinuxChromium = /Linux/.test(navigator.userAgent) && /Chrome\//.test(navigator.userAgent) && !/Edg\//.test(navigator.userAgent) && !/Android/.test(navigator.userAgent);
+    bleBtn.title = isLinuxChromium
+      ? "Web Bluetooth is experimental on Linux Chromium. Launch with --enable-blink-features=WebBluetooth"
+      : "Web Bluetooth is not supported in this browser (try Chrome or Edge)";
+  }
 }
 
 let state: GnssState = createGnssState();
@@ -66,7 +76,10 @@ let rawLines: string[] = [];
 let noiseCount = 0;
 let lastLineMs: number | null = null;
 let msgRate = 0;
-let lastRateCount = 0;
+const rateSamples: { t: number; count: number }[] = [];
+const RATE_WINDOW_MS = 5000;
+const RATE_MIN_SPAN_MS = 3000;
+const DOT_ACTIVE_MS = 2500;
 const link = new SerialGpsLink();
 const bleLink = new BluetoothLeLink();
 const sim = new NmeaSimulator();
@@ -108,6 +121,12 @@ function onLine(line: string): void {
   }
   rawLines.push(line.length > 160 ? line.slice(0, 160) + "…" : line);
   if (rawLines.length > 60) rawLines = rawLines.slice(-30);
+  scheduleRender();
+}
+
+function onGarbage(chars: number): void {
+  noiseCount += chars;
+  lastLineMs = Date.now();
   scheduleRender();
 }
 
@@ -194,13 +213,13 @@ function render(): void {
       trafficText = "Invalid data — check baud rate";
       trafficClass = "bad";
     } else {
-      trafficText = msgRate > 0 ? `Streaming · ${msgRate} msg/s` : "Streaming";
+      trafficText = msgRate > 0 ? `Streaming · ${msgRate.toFixed(1)} msg/s` : "Streaming";
       trafficClass = "ok";
     }
   }
   trafficEl.textContent = trafficText;
   trafficEl.className = trafficClass;
-  actDot.classList.toggle("live", connected && ageMs < 800);
+  actDot.classList.toggle("live", connected && ageMs < DOT_ACTIVE_MS);
 
   drawSkyPlot(skyCanvas, state.sats);
 
@@ -226,7 +245,7 @@ function resetState(): void {
   noiseCount = 0;
   lastLineMs = null;
   msgRate = 0;
-  lastRateCount = 0;
+  rateSamples.length = 0;
   scheduleRender();
 }
 
@@ -243,7 +262,7 @@ function resetTransportUi(): void {
 }
 
 async function closeBle(): Promise<void> {
-  if (bleLink.isOpen) {
+  if (bleLink.isOpen || bleLink.isActive) {
     await bleLink.disconnect();
     bleBtn.textContent = "BLE";
   }
@@ -262,14 +281,20 @@ connectBtn.addEventListener("click", async () => {
     await link.connect(
       Number(baudSelect.value),
       onLine,
-      async (err) => {
-        await link.disconnect();
+      (err) => {
         resetTransportUi();
         if (err) {
           banner.hidden = false;
           banner.textContent = `Serial error: ${errText(err)}`;
         }
       },
+      () => {
+        setBadge("on", "Connected");
+        setDeviceLabel(describeDevice(link.getDeviceInfo()));
+        connectBtn.textContent = "Disconnect";
+        banner.hidden = true;
+      },
+      onGarbage,
     );
     setBadge("on", "Connected");
     setDeviceLabel(describeDevice(link.getDeviceInfo()));
@@ -285,23 +310,31 @@ connectBtn.addEventListener("click", async () => {
 bleBtn.addEventListener("click", async () => {
   if (!BluetoothLeLink.isSupported()) return;
   if (simRunning) toggleSim();
-  if (bleLink.isOpen) {
+  if (bleLink.isOpen || bleLink.isActive) {
     await bleLink.disconnect();
     resetTransportUi();
     return;
   }
-  if (link.isOpen) {
+  if (link.isOpen || link.isActive) {
     await link.disconnect();
   }
   try {
     resetState();
-    await bleLink.connect(onLine, async (err) => {
-      await bleLink.disconnect();
-      resetTransportUi();
-      if (err) {
-        banner.hidden = false;
-        banner.textContent = `Bluetooth error: ${errText(err)}`;
-      }
+    await bleLink.connect({
+      onLine,
+      onGarbage,
+      onClosed: () => {
+        resetTransportUi();
+      },
+      onReconnecting: () => {
+        setBadge("off", "Reconnecting…");
+      },
+      onReconnected: () => {
+        setBadge("on", "Connected (BLE)");
+        setDeviceLabel(describeDevice(bleLink.getDeviceInfo()));
+        bleBtn.textContent = "Disconnect";
+        banner.hidden = true;
+      },
     });
     setBadge("on", "Connected (BLE)");
     setDeviceLabel(describeDevice(bleLink.getDeviceInfo()));
@@ -327,20 +360,10 @@ function toggleSim(): void {
     sim.stop();
     simRunning = false;
     simBtn.textContent = "Simulate";
-    setBadge("off", "Disconnected");
-    setDeviceLabel(null);
+    resetTransportUi();
     return;
   }
-  if (link.isOpen) {
-    void link.disconnect();
-    connectBtn.textContent = "Connect";
-    setDeviceLabel(null);
-  }
-  if (bleLink.isOpen) {
-    void bleLink.disconnect();
-    bleBtn.textContent = "BLE";
-    setDeviceLabel(null);
-  }
+  void stopOtherLinks();
   resetState();
   sim.start(onLine);
   simRunning = true;
@@ -349,11 +372,23 @@ function toggleSim(): void {
   setDeviceLabel("Simulated GPS");
 }
 
+async function stopOtherLinks(): Promise<void> {
+  if (link.isOpen || link.isActive) await link.disconnect();
+  if (bleLink.isOpen || bleLink.isActive) await bleLink.disconnect();
+  resetTransportUi();
+}
+
 setBadge("off", "Disconnected");
 render();
 
 setInterval(() => {
-  msgRate = state.messageCount - lastRateCount;
-  lastRateCount = state.messageCount;
+  const now = Date.now();
+  rateSamples.push({ t: now, count: state.messageCount });
+  while (rateSamples.length > 1 && now - rateSamples[0].t > RATE_WINDOW_MS) rateSamples.shift();
+  const oldest = rateSamples[0];
+  const spanMs = now - oldest.t;
+  if (spanMs >= RATE_MIN_SPAN_MS) {
+    msgRate = (state.messageCount - oldest.count) / (spanMs / 1000);
+  }
   scheduleRender();
 }, 1000);

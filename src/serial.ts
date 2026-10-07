@@ -1,3 +1,6 @@
+import { nmeaChecksum } from "./nmea";
+import { retry } from "./retry";
+
 export const BAUD_RATES = [4800, 9600, 19200, 38400, 57600, 115200, 230400] as const;
 
 export type LineHandler = (line: string) => void;
@@ -39,14 +42,67 @@ const PORT_FILTERS: SerialPortFilter[] = [
   { bluetoothServiceClassId: SPP_SERVICE_UUID },
 ];
 
-export function emitLines(buffer: string, onLine: LineHandler): string {
-  let idx: number;
-  while ((idx = buffer.search(/\r|\n/)) >= 0) {
-    const line = buffer.slice(0, idx).trim();
-    buffer = buffer.slice(idx + 1);
-    if (line) onLine(line);
+export interface SentenceExtraction {
+  sentences: string[];
+  garbage: number;
+  rest: string;
+}
+
+const CHECKSUM_RE = /^[0-9A-Fa-f]{2}$/;
+
+export function extractSentences(buffer: string): SentenceExtraction {
+  const sentences: string[] = [];
+  let garbage = 0;
+  let pos = 0;
+  for (;;) {
+    const start = buffer.indexOf("$", pos);
+    if (start < 0) {
+      garbage += buffer.length - pos;
+      return { sentences, garbage, rest: "" };
+    }
+    garbage += start - pos;
+    const star = buffer.indexOf("*", start + 1);
+    if (star < 0) {
+      return { sentences, garbage, rest: buffer.slice(start) };
+    }
+    const body = buffer.slice(start + 1, star);
+    const nested = body.indexOf("$");
+    if (nested >= 0) {
+      garbage += nested;
+      pos = start + 1 + nested;
+      continue;
+    }
+    const cs = buffer.slice(star + 1, star + 3);
+    if (cs.length < 2) {
+      return { sentences, garbage, rest: buffer.slice(start) };
+    }
+    if (!CHECKSUM_RE.test(cs) || nmeaChecksum(body) !== cs.toUpperCase()) {
+      garbage += star + 1 - start;
+      pos = star + 1;
+      continue;
+    }
+    const end = star + 3;
+    let cursor = end;
+    while (cursor < buffer.length && (buffer[cursor] === "\r" || buffer[cursor] === "\n")) cursor++;
+    sentences.push(buffer.slice(start, end));
+    pos = cursor;
   }
-  return buffer;
+}
+
+function sameUsbIdentity(a: SerialPort | null, b: SerialPort | null): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  try {
+    const ia = a.getInfo();
+    const ib = b.getInfo();
+    return (
+      ia.usbVendorId !== undefined &&
+      ia.usbVendorId === ib.usbVendorId &&
+      ia.usbProductId === ib.usbProductId
+    );
+  } catch {
+    return false;
+  }
 }
 
 export class SerialGpsLink {
@@ -54,13 +110,32 @@ export class SerialGpsLink {
   private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   private loop: Promise<void> | null = null;
   private running = false;
+  private open = false;
+  private resuming = false;
+  private baudRate = 9600;
+  private onLine: LineHandler | null = null;
+  private onClosedCb: ((error?: unknown) => void) | null = null;
+  private onReconnectedCb: (() => void) | null = null;
+  private onGarbageCb: ((chars: number) => void) | null = null;
+
+  constructor() {
+    if (SerialGpsLink.isSupported()) {
+      navigator.serial.addEventListener("connect", (event) => {
+        this.handlePortAppeared(event.target as SerialPort);
+      });
+    }
+  }
 
   static isSupported(): boolean {
     return typeof navigator !== "undefined" && "serial" in navigator;
   }
 
   get isOpen(): boolean {
-    return this.port !== null;
+    return this.open;
+  }
+
+  get isActive(): boolean {
+    return this.running;
   }
 
   getDeviceInfo(): DeviceInfo | null {
@@ -73,16 +148,28 @@ export class SerialGpsLink {
     }
   }
 
-  async connect(baudRate: number, onLine: LineHandler, onClosed: (error?: unknown) => void): Promise<void> {
-    if (this.isOpen) await this.disconnect();
+  async connect(
+    baudRate: number,
+    onLine: LineHandler,
+    onClosed: (error?: unknown) => void,
+    onReconnected?: () => void,
+    onGarbage?: (chars: number) => void,
+  ): Promise<void> {
+    if (this.isOpen || this.running) await this.disconnect();
     const port = await navigator.serial.requestPort({ filters: PORT_FILTERS });
     await port.open({ baudRate });
+    this.baudRate = baudRate;
+    this.onLine = onLine;
+    this.onClosedCb = onClosed;
+    this.onReconnectedCb = onReconnected ?? null;
+    this.onGarbageCb = onGarbage ?? null;
     this.port = port;
     this.running = true;
-    this.loop = this.readLoop(port, onLine, onClosed);
+    this.open = true;
+    this.loop = this.readLoop(port);
   }
 
-  private async readLoop(port: SerialPort, onLine: LineHandler, onClosed: (error?: unknown) => void): Promise<void> {
+  private async readLoop(port: SerialPort): Promise<void> {
     const decoder = new TextDecoder();
     let buffer = "";
     try {
@@ -95,7 +182,10 @@ export class SerialGpsLink {
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
             if (buffer.length > 65536) buffer = buffer.slice(-32768);
-            buffer = emitLines(buffer, onLine);
+            const result = extractSentences(buffer);
+            buffer = result.rest;
+            for (const sentence of result.sentences) this.onLine?.(sentence);
+            if (result.garbage > 0) this.onGarbageCb?.(result.garbage);
           }
         } finally {
           this.reader = null;
@@ -103,14 +193,55 @@ export class SerialGpsLink {
         }
         if (!this.running) return;
       }
-      if (this.running) onClosed();
+      if (this.running) void this.handleUnexpectedClose();
     } catch (err) {
-      if (this.running) onClosed(err);
+      if (this.running) void this.handleUnexpectedClose(err);
     }
+  }
+
+  private async handleUnexpectedClose(error?: unknown): Promise<void> {
+    this.open = false;
+    this.onClosedCb?.(error);
+    if (!this.running || !this.port) return;
+    await this.tryResume();
+  }
+
+  private async tryResume(): Promise<void> {
+    if (this.resuming) return;
+    this.resuming = true;
+    try {
+      const port = this.port;
+      if (!port || !this.running) return;
+      const reopened = await retry(3, async () => {
+        if (!this.running) throw new Error("aborted");
+        try {
+          await port.close();
+        } catch {
+          /* device may be gone or not open */
+        }
+        await port.open({ baudRate: this.baudRate });
+      })
+        .then(() => true)
+        .catch(() => false);
+      if (!reopened || !this.running || this.port !== port) return;
+      this.open = true;
+      this.onReconnectedCb?.();
+      this.loop = this.readLoop(port);
+    } finally {
+      this.resuming = false;
+    }
+  }
+
+  private handlePortAppeared(candidate: SerialPort): void {
+    if (!this.running || this.open || this.resuming) return;
+    if (!sameUsbIdentity(candidate, this.port)) return;
+    this.port = candidate;
+    void this.tryResume();
   }
 
   async disconnect(): Promise<void> {
     this.running = false;
+    this.open = false;
     try {
       await this.reader?.cancel();
     } catch {

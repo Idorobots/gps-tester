@@ -235,7 +235,8 @@ function render(): void {
 }
 
 function setBadge(mode: "off" | "on" | "sim", text: string): void {
-  badge.className = "badge " + (mode === "off" ? "off" : mode === "on" ? "on" : "sim");
+  const cls = mode === "on" ? "pill-live" : mode === "sim" ? "pill-sim" : "pill-off";
+  badge.className = `pill ${cls}`;
   connText.textContent = text;
 }
 
